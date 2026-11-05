@@ -21,6 +21,8 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
+*.spec
+
 
 # Environment variables
 .env

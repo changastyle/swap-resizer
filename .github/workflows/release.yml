@@ -1,0 +1,130 @@
+# ============================================================================
+#  release.yml
+#  Compila EN LA NUBE el mismo build que CI-CD-LOCAL/GENERAR-APPIMAGE.sh:
+#    - Push a main/master: build Linux -> Release con el AppImage
+#    - Pull request a main/master: solo compila (check, sin release)
+#  El binario NUNCA se commitea (OUT/ esta en .gitignore): viaja como
+#  artifact del workflow y de ahi al Release.
+#  (Sin job Windows: la app es Linux-only, administra /swapfile.)
+# ============================================================================
+
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  #  LINUX: corre el mismo GENERAR-APPIMAGE.sh que el build local
+  # ---------------------------------------------------------------------------
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Libs que Qt6 necesita para el smoke test (sin display -> offscreen)
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgl1 libegl1 libxkbcommon0 \
+            libdbus-1-3 libfontconfig1 libxcb-cursor0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # El script cae a python3 del PATH (= setup-python) al no existir .venv:
+      - name: Build AppImage (GENERAR-APPIMAGE.sh)
+        run: bash CI-CD-LOCAL/GENERAR-APPIMAGE.sh
+
+      # La GUI no se abre sin display: con offscreen debe quedar viva en
+      # el event loop -> rc 124 (timeout) = OK, cualquier otro rc = crash.
+      - name: Smoke test (Qt offscreen)
+        run: |
+          chmod +x OUT/SwapResizer-x86_64.AppImage
+          set +e
+          QT_QPA_PLATFORM=offscreen timeout 8 \
+            OUT/SwapResizer-x86_64.AppImage --appimage-extract-and-run
+          rc=$?
+          set -e
+          if [ "$rc" -ne 124 ]; then
+            echo "::error::Smoke test fallo (rc=$rc)"
+            exit 1
+          fi
+          echo "AppImage arranca OK"
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: OUT/*.AppImage
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  #  RELEASE: solo en push (no en PRs). Version de VERSION + fecha + run.
+  # ---------------------------------------------------------------------------
+  release:
+    if: github.event_name == 'push'
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: rel
+          merge-multiple: true
+
+      - name: Get version and date
+        id: meta
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "date=$(date +'%d-%m-%Y')" >> $GITHUB_OUTPUT
+          echo "Artefactos para el release:"
+          ls -lh rel/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.meta.outputs.version }}-${{ steps.meta.outputs.date }}-r${{ github.run_number }}
+          name: "Swap Resizer v${{ steps.meta.outputs.version }} - ${{ steps.meta.outputs.date }}"
+          body: |
+            ## Swap Resizer v${{ steps.meta.outputs.version }} - Build ${{ steps.meta.outputs.date }}
+
+            Aplicacion de escritorio en PyQt6 para monitorizar y
+            redimensionar el swapfile (`/swapfile`) en Linux, estilo
+            Monitor del Sistema de GNOME: anillo arrastrable para elegir
+            el tamano, quesitos de uso de RAM/swap, control permanente
+            de swappiness y elevacion grafica con `pkexec`.
+
+            ### Descarga
+            - **SwapResizer-*.AppImage** — paquete autocontenido para
+              Linux x86_64
+
+            ### Como usar
+            1. Descargar el `.AppImage`, darle permisos de ejecucion
+               (`chmod +x`) y ejecutarlo con doble clic
+            2. En distros sin FUSE 2 (Ubuntu 22.04+): ejecutar con
+               `--appimage-extract-and-run`
+            3. Requiere `pkexec` (polkit) para aplicar cambios y un
+               swapfile en `/swapfile` declarado en `/etc/fstab`
+            4. Si Qt no arranca con `xcb-cursor0 ... is needed`:
+               `sudo apt install libxcb-cursor0`
+          files: rel/*
+          draft: false
+          prerelease: false
